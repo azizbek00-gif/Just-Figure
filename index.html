@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hand Figure</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  /* Kamera tasviri ko'zguday (selfie) ko'rinadi */
+  #cam { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover;
+    transform: scaleX(-1); background: #111; }
+  /* Figura, zarralar va qo'l skeleti shu canvas'ga chiziladi */
+  #fx { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #hint { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    color: rgba(255,255,255,.88); font-size: 15px; text-align: center; padding: 0 16px;
+    text-shadow: 0 1px 6px rgba(0,0,0,.75); transition: opacity .4s; pointer-events: none; }
+  #status { position: fixed; left: 10px; bottom: 8px; color: rgba(255,255,255,.82);
+    font: 11px ui-monospace, Menlo, Consolas, monospace;
+    text-shadow: 0 1px 4px rgba(0,0,0,.85); pointer-events: none; }
+  #keys { position: fixed; right: 10px; bottom: 8px; color: rgba(255,255,255,.55);
+    font: 11px ui-monospace, Menlo, Consolas, monospace;
+    text-shadow: 0 1px 4px rgba(0,0,0,.85); pointer-events: none; }
+</style>
+</head>
+<body>
+<video id="cam" autoplay muted playsinline></video>
+<canvas id="fx"></canvas>
+<div id="hint">Kamera yoqilmoqda…</div>
+<div id="status"></div>
+<div id="keys">S — qo'llarni almashtirish</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const WASM  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+// ---------- Sozlamalar (kerak bo'lsa shu yerdan o'zgartiring) ----------
+const CFG = {
+  // Ko'rinish
+  lineWidth: 3.6,    // figura chizig'i qalinligi
+  ghosts: 14,        // "sim-ip" izi: nechta nusxa (0 = iz yo'q)
+  ghostStep: 2,      // iz nusxalari orasidagi kadr oralig'i (kattaroq = uzunroq, yoyilgan iz)
+  hueSpread: 36,     // figura bo'ylab rang o'zgarishi (daraja)
+  sparks: 45,        // sekundiga nechta uchqun chiqishi
+  morphTime: 0.75,   // figuradan figuraga o'tish davomiyligi (soniya)
+  hover: 0.42,       // figura kaftdan qancha balandda turadi (ekran balandligiga nisbatan)
+  sizeK: 1.0,        // figura o'lchami / qo'l o'lchami
+  // Barmoq aniqlash (daraja: 0 = to'g'ri barmoq). "On" = ochiq deb hisoblash, "Off" = yopiq deb hisoblash
+  fingerBendOn: 80,  fingerBendOff: 110,
+  thumbBendOn: 65,   thumbBendOff: 95,
+  thumbRatioOn: 1.3, thumbRatioOff: 1.1,
+  // Ikkinchi qo'l: chimdish -> masshtab
+  pinchMin: 0.1, pinchGain: 2.0,
+  // Aniqlash vaqtincha uzilsa, nechta kadr kutib turish
+  grace: 5
+};
+
+const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],
+  [11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+// ---------- Yordamchi funksiyalar ----------
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+const video = document.getElementById("cam");
+const canvas = document.getElementById("fx");
+const ctx = canvas.getContext("2d");
+const hint = document.getElementById("hint");
+const statusEl = document.getElementById("status");
+
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+// Video koordinatalarini (0..1) ekran pikselidagi nuqtaga aylantirish
+// (object-fit: cover va ko'zgu hisobga olingan)
+function mapPoint(p) {
+  const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+  const s = Math.max(W / vw, H / vh);
+  const ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
+  return { x: ox + (1 - p.x) * vw * s, y: oy + p.y * vh * s };
+}
+
+// ---------- One Euro filtri: titrashni yo'qotadi, tez harakatda esa kechikmaydi ----------
+class OneEuro {
+  constructor(minCutoff, beta, dCutoff = 1) {
+    this.mc = minCutoff; this.b = beta; this.dc = dCutoff;
+    this.x = null; this.dx = 0; this.t = 0;
+  }
+  static alpha(cut, dt) { const tau = 1 / (2 * Math.PI * cut); return 1 / (1 + tau / dt); }
+  filter(v, t) {
+    if (this.x === null) { this.x = v; this.t = t; return v; }
+    const dt = Math.max(1e-3, t - this.t); this.t = t;
+    this.dx += OneEuro.alpha(this.dc, dt) * ((v - this.x) / dt - this.dx);
+    const cut = this.mc + this.b * Math.abs(this.dx);
+    this.x += OneEuro.alpha(cut, dt) * (v - this.x);
+    return this.x;
+  }
+}
+const banks = { lead: null, second: null };
+function makeBank() {
+  return {
+    px: Array.from({ length: 42 }, () => new OneEuro(1.8, 0.02)),  // ekran pikseli
+    w:  Array.from({ length: 63 }, () => new OneEuro(1.5, 0.02))   // 3D (mm)
+  };
+}
+function smooth(role, h, t) {
+  if (!banks[role]) banks[role] = makeBank();
+  const b = banks[role];
+  return {
+    p: h.p.map((q, i) => ({ x: b.px[i * 2].filter(q.x, t), y: b.px[i * 2 + 1].filter(q.y, t) })),
+    w: h.w.map((q, i) => ({
+      x: b.w[i * 3].filter(q.x, t), y: b.w[i * 3 + 1].filter(q.y, t), z: b.w[i * 3 + 2].filter(q.z, t)
+    }))
+  };
+}
+
+// ---- RENDER-BEGIN ----
+// ======================= FIGURALAR VA ANIMATSIYA =======================
+
+// ---------- Geometriya: N tomonli prizma, silindr, chiziq, tekislik ----------
+function prism(N) {
+  const R = 1 / (2 * Math.sin(Math.PI / N)); // asos tomoni = 1, balandlik = 1
+  const rot = N === 4 ? Math.PI / 4 : 0;
+  const top = [], bot = [];
+  for (let i = 0; i < N; i++) {
+    const a = rot + (i / N) * Math.PI * 2;
+    top.push([R * Math.cos(a), -0.5, R * Math.sin(a)]);
+    bot.push([R * Math.cos(a), 0.5, R * Math.sin(a)]);
+  }
+  const paths = [[...top, top[0]], [...bot, bot[0]]];
+  for (let i = 0; i < N; i++) paths.push([top[i], bot[i]]);
+  return { paths, dots: [...top, ...bot] };
+}
+function cylinder() {
+  const seg = 64, R = 0.5, top = [], bot = [];
+  for (let i = 0; i <= seg; i++) {
+    const a = (i / seg) * Math.PI * 2;
+    top.push([R * Math.cos(a), -0.55, R * Math.sin(a)]);
+    bot.push([R * Math.cos(a), 0.55, R * Math.sin(a)]);
+  }
+  const paths = [top, bot];
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    paths.push([[R * Math.cos(a), -0.55, R * Math.sin(a)], [R * Math.cos(a), 0.55, R * Math.sin(a)]]);
+  }
+  return { paths, dots: null };
+}
+const GEO = {
+  0: cylinder(),
+  1: { paths: [[[0, -0.75, 0], [0, 0.75, 0]]], dots: [[0, -0.75, 0], [0, 0.75, 0]] },
+  2: { paths: [[[-0.45, -0.6, 0], [0.45, -0.6, 0], [0.45, 0.6, 0], [-0.45, 0.6, 0], [-0.45, -0.6, 0]]],
+       dots: [[-0.45, -0.6, 0], [0.45, -0.6, 0], [0.45, 0.6, 0], [-0.45, 0.6, 0]] },
+  3: prism(3),
+  4: prism(4),
+  5: prism(5)
+};
+
+// Har bir figura aynan K ta kesmadan iborat qilib qayta bo'linadi.
+// Shunda figuradan figuraga o'tishda kesmalar bir-biriga silliq "oqib" o'tadi (morf).
+const K = 160;
+function toSegments(paths) {
+  const segs = [];
+  for (const path of paths) for (let i = 1; i < path.length; i++) segs.push([path[i - 1], path[i]]);
+  const len = s => Math.hypot(s[1][0] - s[0][0], s[1][1] - s[0][1], s[1][2] - s[0][2]);
+  while (segs.length < K) {                       // eng uzun kesmani ikkiga bo'lamiz
+    let bi = 0, bl = -1;
+    for (let i = 0; i < segs.length; i++) { const l = len(segs[i]); if (l > bl) { bl = l; bi = i; } }
+    const [a, b] = segs[bi];
+    const m = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
+    segs.splice(bi, 1, [a, m], [m, b]);
+  }
+  // Burchak bo'yicha tartiblash: morfda yaqin kesmalar bir-biriga mos tushadi
+  const key = s => Math.atan2((s[0][2] + s[1][2]) / 2, (s[0][0] + s[1][0]) / 2) * 100 + (s[0][1] + s[1][1]) / 2;
+  segs.sort((p, q) => key(p) - key(q));
+  const out = new Float32Array(K * 6);
+  segs.forEach((s, i) => out.set([...s[0], ...s[1]], i * 6));
+  return out;
+}
+const SEG = {};
+for (const n of [0, 1, 2, 3, 4, 5]) SEG[n] = toSegments(GEO[n].paths);
+
+// Rang: [bo'yoq (hue), to'yinganlik, yorqinlik]
+const PALETTE = {
+  0: { h: 215, s: 40,  l: 88 },  // musht    -> silindr
+  1: { h: 188, s: 100, l: 60 },  // 1 barmoq -> chiziq
+  2: { h: 140, s: 100, l: 58 },  // 2        -> to'rtburchak
+  3: { h: 50,  s: 100, l: 60 },  // 3        -> uchburchakli prizma
+  4: { h: 24,  s: 100, l: 58 },  // 4        -> kub
+  5: { h: 318, s: 100, l: 64 }   // 5        -> beshburchakli prizma
+};
+
+// ---------- Figura holati ----------
+const S = {
+  shape: -1, alpha: 0, alphaT: 0,
+  cx: 0, cy: 0, size: 100, rx: 0.5, ry: 0.3, rz: 0,
+  kickX: 0, kickY: 0, scale: 1,
+  from: new Float32Array(K * 6), to: SEG[4], cur: new Float32Array(K * 6),
+  morphT: 1, morphE: 1, burstT: 1, emitAcc: 0, fromPoint: false,
+  col: { h: 188, s: 100, l: 60 },
+  hist: []
+};
+const PARTS = [];
+const PR = new Float32Array(K * 6), PG = new Float32Array(K * 6);
+
+const easeInOut = t => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const lerpHue = (a, b, t) => { const d = ((b - a + 540) % 360) - 180; return (a + d * t + 360) % 360; };
+const depthFactor = z => clamp(0.5 - z / 1.8, 0, 1);   // oldingi qirralar yorqinroq
+
+// 3D nuqtani ekranga proyeksiya qilish: [x, y, chuqurlik]
+function project(v, st) {
+  const [x, y, z] = v;
+  const cY = Math.cos(st.ry), sY = Math.sin(st.ry);
+  const x1 = x * cY + z * sY, z1 = -x * sY + z * cY;
+  const cX = Math.cos(st.rx), sX = Math.sin(st.rx);
+  const y1 = y * cX - z1 * sX, z2 = y * sX + z1 * cX;
+  const cZ = Math.cos(st.rz), sZ = Math.sin(st.rz);
+  const x2 = x1 * cZ - y1 * sZ, y2 = x1 * sZ + y1 * cZ;
+  const persp = 4 / (4 + z2);
+  return [st.cx + x2 * st.size * persp, st.cy + y2 * st.size * persp, z2];
+}
+// Hamma K ta kesmani bir yo'la proyeksiya qilish (out: x1,y1,z1,x2,y2,z2 ...)
+function projectSegs(seg, st, out) {
+  const cY = Math.cos(st.ry), sY = Math.sin(st.ry), cX = Math.cos(st.rx), sX = Math.sin(st.rx);
+  const cZ = Math.cos(st.rz), sZ = Math.sin(st.rz);
+  for (let o = 0; o < K * 6; o += 3) {
+    const x = seg[o], y = seg[o + 1], z = seg[o + 2];
+    const x1 = x * cY + z * sY, z1 = -x * sY + z * cY;
+    const y1 = y * cX - z1 * sX, z2 = y * sX + z1 * cX;
+    const x2 = x1 * cZ - y1 * sZ, y2 = x1 * sZ + y1 * cZ;
+    const persp = 4 / (4 + z2);
+    out[o] = st.cx + x2 * st.size * persp;
+    out[o + 1] = st.cy + y2 * st.size * persp;
+    out[o + 2] = z2;
+  }
+}
+
+// ---------- Uchqunlar ----------
+function spawnSpark(x, y, vx, vy, life, size, h) {
+  if (PARTS.length > 260) PARTS.shift();
+  PARTS.push({ x, y, vx, vy, life, max: life, size, h });
+}
+function randomPoint(seg, st) {
+  const i = (Math.random() * K) | 0, o = i * 6 + (Math.random() < 0.5 ? 0 : 3);
+  return project([seg[o], seg[o + 1], seg[o + 2]], st);
+}
+function burst(n) {                               // figura almashganda uchqunlar portlashi
+  const st = { cx: S.cx, cy: S.cy, size: S.size, rx: S.rx, ry: S.ry, rz: S.rz };
+  for (let i = 0; i < n; i++) {
+    const p = randomPoint(S.to, st);
+    const vx = p[0] - S.cx, vy = p[1] - S.cy, l = Math.hypot(vx, vy) || 1, sp = 90 + Math.random() * 230;
+    spawnSpark(p[0], p[1], vx / l * sp, vy / l * sp, 0.6 + Math.random() * 0.7,
+      1.2 + Math.random() * 2.2, S.col.h + (Math.random() - 0.5) * 40);
+  }
+}
+
+// ---------- Figuradan figuraga o'tish ----------
+function startMorph(next, fromPoint) {
+  const s = SEG[next];
+  if (fromPoint) {                                // birinchi marta: nuqtadan "ochilib" chiqadi
+    for (let i = 0; i < K * 6; i++) S.from[i] = s[i] * 0.04;
+    S.cur.set(S.from);
+    S.col = { ...PALETTE[next] };
+  } else {
+    S.from.set(S.cur);                            // joriy holatdan davom etadi (o'tish uzilmaydi)
+  }
+  S.to = s; S.shape = next; S.fromPoint = !!fromPoint;
+  S.morphT = 0; S.morphE = 0; S.burstT = 0;
+  burst(fromPoint ? 36 : 70);
+}
+
+// tgt: { track: qo'l bor, show: figura ko'rinsin, shape: 0..5, x, y, size }
+function animate(dt, now, tgt) {
+  const a = 1 - Math.exp(-dt * 16);
+
+  if (tgt.track) {
+    if (S.alpha < 0.05) { S.cx = tgt.x; S.cy = tgt.y; S.size = tgt.size; }
+    const dx = tgt.x - S.cx, dy = tgt.y - S.cy;
+    S.cx += dx * a; S.cy += dy * a; S.size += (tgt.size - S.size) * a;
+    S.kickY = clamp(dx * 0.01, -4, 4);            // qo'l tez harakatlansa, figura qo'shimcha aylanadi
+    S.kickX = clamp(dy * 0.01, -4, 4);
+  } else { S.kickX *= 0.9; S.kickY *= 0.9; }
+
+  S.alphaT = tgt.show ? 1 : 0;
+  if (!tgt.show && S.alpha < 0.02) S.shape = -1;
+  if (tgt.show && tgt.shape !== S.shape) startMorph(tgt.shape, S.shape < 0);
+
+  // Morf
+  const morphing = S.morphT < 1;
+  if (morphing) {
+    S.morphT = Math.min(1, S.morphT + dt / CFG.morphTime);
+    S.morphE = easeInOut(S.morphT);
+    for (let i = 0; i < K * 6; i++) S.cur[i] = S.from[i] + (S.to[i] - S.from[i]) * S.morphE;
+  }
+  S.burstT = Math.min(1, S.burstT + dt / 0.65);
+
+  // Rang silliq o'tadi
+  if (S.shape >= 0) {
+    const c = PALETTE[S.shape], k = 1 - Math.exp(-dt * 7);
+    S.col.h = lerpHue(S.col.h, c.h, k);
+    S.col.s += (c.s - S.col.s) * k;
+    S.col.l += (c.l - S.col.l) * k;
+  }
+
+  // Aylanish: o'tish paytida girdob kabi tezlashadi
+  const boost = morphing ? 7 * (1 - S.morphE) : 0;
+  S.ry += dt * (0.7 + S.kickY + boost);
+  S.rx += dt * (0.4 + S.kickX);
+  S.rz = Math.sin(now / 1600) * 0.3;
+
+  // "Nafas olish" va o'tish paytidagi puls
+  const pulse = morphing ? Math.sin(Math.PI * S.morphE) : 0;
+  const sz = S.size * (1 + 0.03 * Math.sin(now / 600) + 0.2 * pulse);
+  S.hist.unshift({ cx: S.cx, cy: S.cy, size: sz, rx: S.rx, ry: S.ry, rz: S.rz });
+  const maxHist = CFG.ghosts * CFG.ghostStep + 1;
+  if (S.hist.length > maxHist) S.hist.length = maxHist;
+
+  S.alpha += (S.alphaT - S.alpha) * (1 - Math.exp(-dt * 8));
+
+  // Uchqunlar
+  if (S.alpha > 0.3 && S.shape >= 0) {
+    S.emitAcc += dt * CFG.sparks;
+    while (S.emitAcc >= 1) {
+      S.emitAcc -= 1;
+      const p = randomPoint(S.cur, S.hist[0]);
+      spawnSpark(p[0], p[1], (Math.random() - 0.5) * 30 + S.kickY * 10, -15 - Math.random() * 40,
+        0.8 + Math.random() * 0.9, 0.9 + Math.random() * 1.6, S.col.h + (Math.random() - 0.5) * 40);
+    }
+  }
+  const damp = Math.exp(-dt * 1.5);
+  for (let i = PARTS.length - 1; i >= 0; i--) {
+    const p = PARTS[i];
+    p.life -= dt;
+    if (p.life <= 0) { PARTS.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= damp; p.vy *= damp;
+  }
+}
+
+// ---------- Chizish ----------
+const hsl = (h, s, l, a) => `hsla(${h.toFixed(1)},${s.toFixed(0)}%,${l.toFixed(0)}%,${a.toFixed(3)})`;
+
+function drawOrbit(now, A, c) {                   // figura atrofida aylanuvchi halqa va yorug' shar
+  const s0 = S.hist[0];
+  const grow = S.fromPoint ? easeInOut(clamp(S.morphT * 1.4, 0, 1)) : 1;   // ochilish paytida halqa ham kattalashadi
+  A *= grow;
+  const st = { cx: s0.cx, cy: s0.cy, size: s0.size * 1.3 * (0.25 + 0.75 * grow), rx: 1.15, ry: now / 2200, rz: 0.25 };
+  const N = 80;
+  const pts = [];
+  for (let i = 0; i <= N; i++) { const a = (i / N) * Math.PI * 2; pts.push(project([Math.cos(a), 0, Math.sin(a)], st)); }
+  for (const front of [false, true]) {
+    ctx.strokeStyle = hsl(c.h, c.s, c.l, A * (front ? 0.28 : 0.09));
+    ctx.lineWidth = front ? 1.6 : 1.1;
+    ctx.beginPath();
+    for (let i = 1; i <= N; i++) {
+      const isFront = (pts[i][2] + pts[i - 1][2]) / 2 < 0;
+      if (isFront !== front) continue;
+      ctx.moveTo(pts[i - 1][0], pts[i - 1][1]); ctx.lineTo(pts[i][0], pts[i][1]);
+    }
+    ctx.stroke();
+  }
+  const b = project([Math.cos(now / 700), 0, Math.sin(now / 700)], st);
+  const k = b[2] < 0 ? 1 : 0.45;
+  ctx.fillStyle = hsl(c.h, 100, 80, A * 0.9 * k);
+  ctx.beginPath(); ctx.arc(b[0], b[1], 3.2 * k + 1, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawFigure(now) {
+  if (S.alpha < 0.01 || S.shape < 0 || !S.hist.length) return;
+  const A = S.alpha, lw = CFG.lineWidth, c = S.col;
+
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+
+  drawOrbit(now, A, c);
+
+  // 1) "Sim-ip" izi: o'tgan kadrlardagi nusxalar, ingichka va xira
+  for (let i = CFG.ghosts; i >= 1; i--) {
+    const st = S.hist[Math.min(i * CFG.ghostStep, S.hist.length - 1)];
+    projectSegs(S.cur, st, PG);
+    const t = 1 - i / (CFG.ghosts + 1);
+    ctx.strokeStyle = hsl(c.h + i * 2.5, c.s, c.l, A * (0.035 + 0.2 * t * t));
+    ctx.lineWidth = Math.max(0.8, lw * 0.35);
+    ctx.beginPath();
+    for (let o = 0; o < K * 6; o += 6) { ctx.moveTo(PG[o], PG[o + 1]); ctx.lineTo(PG[o + 3], PG[o + 4]); }
+    ctx.stroke();
+  }
+
+  // 2) Asosiy figura: avval yorug'lik (bloom)
+  projectSegs(S.cur, S.hist[0], PR);
+  ctx.save();
+  ctx.shadowColor = hsl(c.h, 100, 60, 0.95);
+  ctx.shadowBlur = 22 * DPR;
+  ctx.strokeStyle = hsl(c.h, c.s, c.l, A * 0.5);
+  ctx.lineWidth = lw;
+  ctx.beginPath();
+  for (let o = 0; o < K * 6; o += 6) { ctx.moveTo(PR[o], PR[o + 1]); ctx.lineTo(PR[o + 3], PR[o + 4]); }
+  ctx.stroke();
+  ctx.restore();
+
+  // 3) Qalin, aniq qirralar: oldingilari yorqin va qalin, orqadagilari xiraroq, rang bo'ylab o'zgaradi
+  ctx.globalCompositeOperation = "source-over";
+  ctx.lineCap = S.morphT < 1 ? "round" : "butt";   // o'tish paytida chiziqlar uzilib qolmasin
+  for (let k = 0; k < K; k++) {
+    const o = k * 6;
+    const d = depthFactor((PR[o + 2] + PR[o + 5]) / 2);
+    const hh = c.h + (k / K - 0.5) * CFG.hueSpread + 8 * Math.sin(now / 900);
+    ctx.strokeStyle = hsl(hh, c.s, c.l + 6 * d, A * (0.5 + 0.5 * d));
+    ctx.lineWidth = lw * (0.72 + 0.28 * d);
+    ctx.beginPath(); ctx.moveTo(PR[o], PR[o + 1]); ctx.lineTo(PR[o + 3], PR[o + 4]); ctx.stroke();
+  }
+
+  // 4) Oq "yadro": chiziqlar o'tkir ko'rinadi
+  ctx.globalCompositeOperation = "lighter";
+  ctx.lineCap = "round";
+  ctx.strokeStyle = `rgba(255,255,255,${(A * 0.5).toFixed(3)})`;
+  ctx.lineWidth = lw * 0.33;
+  ctx.beginPath();
+  for (let o = 0; o < K * 6; o += 6) { ctx.moveTo(PR[o], PR[o + 1]); ctx.lineTo(PR[o + 3], PR[o + 4]); }
+  ctx.stroke();
+
+  // 5) Uchlardagi nuqtalar (o'tish tugagach paydo bo'ladi)
+  const geo = GEO[S.shape];
+  const dotA = clamp((S.morphT - 0.7) / 0.3, 0, 1);
+  if (geo.dots && dotA > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${(A * 0.9 * dotA).toFixed(3)})`;
+    for (const v of geo.dots) {
+      const q = project(v, S.hist[0]);
+      ctx.beginPath(); ctx.arc(q[0], q[1], lw * (0.6 + 0.35 * depthFactor(q[2])), 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // 6) Figura almashganda kengayuvchi halqa
+  if (S.burstT < 1) {
+    const p = S.burstT, s0 = S.hist[0];
+    ctx.strokeStyle = hsl(c.h, c.s, 75, A * Math.pow(1 - p, 2) * 0.6);
+    ctx.lineWidth = 2.2 * (1 - p) + 0.6;
+    ctx.beginPath(); ctx.arc(s0.cx, s0.cy, s0.size * (0.5 + 1.3 * p), 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawParticles() {
+  if (!PARTS.length) return;
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  for (const p of PARTS) {
+    const k = p.life / p.max;
+    ctx.fillStyle = hsl(p.h, 100, 72, k * k * 0.9);
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size * (0.5 + 0.5 * k), 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+// ---- RENDER-END ----
+
+// ---- FINGERS-BEGIN ----
+// ---------- Barmoqlarni sanash (3D burchaklar bo'yicha, qo'l qanday burilganidan qat'i nazar) ----------
+const d3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+// b nuqtadagi bukilish burchagi (daraja): 0 = to'g'ri, 90 = to'g'ri burchak
+function bend(a, b, c) {
+  const ux = b.x - a.x, uy = b.y - a.y, uz = b.z - a.z;
+  const vx = c.x - b.x, vy = c.y - b.y, vz = c.z - b.z;
+  const cos = (ux * vx + uy * vy + uz * vz) / ((Math.hypot(ux, uy, uz) * Math.hypot(vx, vy, vz)) + 1e-6);
+  return Math.acos(Math.max(-1, Math.min(1, cos))) * 180 / Math.PI;
+}
+const fingerOn = [false, false, false, false, false]; // bosh, ko'rsatkich, o'rta, nomsiz, jimjiloq
+function updateFingers(w) {
+  // Bosh barmoq: bo'g'imlari to'g'ri va uchi kaftdan uzoqda bo'lsa — ochiq
+  const tBend = bend(w[1], w[2], w[3]) + bend(w[2], w[3], w[4]);
+  const tRatio = d3(w[4], w[17]) / Math.max(d3(w[5], w[17]), 1e-3);
+  if (!fingerOn[0]) fingerOn[0] = tBend < CFG.thumbBendOn && tRatio > CFG.thumbRatioOn;
+  else fingerOn[0] = !(tBend > CFG.thumbBendOff || tRatio < CFG.thumbRatioOff);
+  // Qolgan 4 barmoq: 3 ta bo'g'imning bukilishi yig'indisi kichik bo'lsa — ochiq
+  const F = [[5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]];
+  F.forEach(([mcp, pip, dip, tip], i) => {
+    const total = bend(w[0], w[mcp], w[pip]) + bend(w[mcp], w[pip], w[dip]) + bend(w[pip], w[dip], w[tip]);
+    const reach = d3(w[tip], w[0]) / Math.max(d3(w[pip], w[0]), 1e-3);
+    if (!fingerOn[i + 1]) fingerOn[i + 1] = total < CFG.fingerBendOn && reach > 1.05;
+    else fingerOn[i + 1] = !(total > CFG.fingerBendOff || reach < 0.98);
+  });
+  return fingerOn.reduce((n, v) => n + (v ? 1 : 0), 0);
+}
+// ---- FINGERS-END ----
+
+// ---------- Kuzatuv holati ----------
+const T = { lead: null, second: null, missL: 0, missS: 0, count: -1 };
+const countHist = [];
+let swap = false;
+window.addEventListener("keydown", e => { if (e.key === "s" || e.key === "S") swap = !swap; });
+
+// Qo'llarni rollarga ajratish: avvalgi kadrdagi joyiga qarab (qo'llar kesishsa ham almashib ketmaydi).
+// Birinchi marta: ekranda o'ngdagi qo'l — asosiy (barmoq sanaladi), chapdagisi — ikkinchi (masshtab).
+function assign(raw) {
+  const pl = T.lead ? T.lead.p[0] : null, ps = T.second ? T.second.p[0] : null;
+  if (raw.length >= 2) {
+    const [a, b] = raw;
+    if (pl && ps) {
+      const d1 = dist(a.p[0], pl) + dist(b.p[0], ps), d2 = dist(b.p[0], pl) + dist(a.p[0], ps);
+      return d1 <= d2 ? { lead: a, second: b } : { lead: b, second: a };
+    }
+    if (pl) return dist(a.p[0], pl) <= dist(b.p[0], pl) ? { lead: a, second: b } : { lead: b, second: a };
+    const s = [a, b].sort((x, y) => x.p[0].x - y.p[0].x);
+    return swap ? { lead: s[0], second: s[1] } : { lead: s[1], second: s[0] };
+  }
+  const h = raw[0];
+  if (pl && ps) {
+    return dist(h.p[0], pl) <= dist(h.p[0], ps) ? { lead: h, second: null } : { lead: null, second: h };
+  }
+  if (!pl && ps) return { lead: h, second: null, promote: true };
+  return { lead: h, second: null };
+}
+
+function modeOf(list) {
+  const c = new Array(6).fill(0);
+  list.forEach(v => c[v]++);
+  let best = 0;
+  for (let i = 1; i < 6; i++) if (c[i] > c[best]) best = i;
+  return best;
+}
+function onLead() {
+  const c = updateFingers(T.lead.w);
+  countHist.push(c);
+  if (countHist.length > 5) countHist.shift();
+  if (T.count < 0) {                       // birinchi marta: 3 ta o'lchovdan keyin qaror qilamiz
+    if (countHist.length >= 3) T.count = modeOf(countHist);
+    return;
+  }
+  const c5 = new Array(6).fill(0);
+  countHist.forEach(v => c5[v]++);
+  for (let i = 0; i < 6; i++) if (i !== T.count && c5[i] >= 3) { T.count = i; break; } // 5 tadan 3 tasi kelishsa
+}
+function resetFingers() { fingerOn.fill(false); countHist.length = 0; T.count = -1; }
+
+function track(raw, t) {
+  if (raw.length === 0) {
+    T.missL++; T.missS++;
+  } else {
+    const r = assign(raw);
+    if (r.promote) { T.second = null; banks.second = null; T.missS = 0; }
+    if (r.lead) { T.lead = smooth("lead", r.lead, t); T.missL = 0; onLead(); } else T.missL++;
+    if (r.second) { T.second = smooth("second", r.second, t); T.missS = 0; } else if (!r.promote) T.missS++;
+  }
+  if (T.missL > CFG.grace) { T.lead = null; banks.lead = null; resetFingers(); }
+  if (T.missS > CFG.grace) { T.second = null; banks.second = null; }
+}
+
+let landmarker = null, modelReady = false;
+let lastVideoTime = -1;
+let fps = 0, detFrames = 0, fpsT = performance.now();
+
+function detect() {
+  if (!landmarker || video.readyState < 2) return;
+  if (video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const nowMs = performance.now();
+  const res = landmarker.detectForVideo(video, nowMs);
+  detFrames++;
+  if (nowMs - fpsT > 1000) { fps = Math.round(detFrames * 1000 / (nowMs - fpsT)); detFrames = 0; fpsT = nowMs; }
+
+  const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+  const lms = res.landmarks || [], wls = res.worldLandmarks || [];
+  const raw = lms.map((lm, i) => ({
+    p: lm.map(mapPoint),
+    w: wls[i] ? wls[i].map(q => ({ x: q.x * 1000, y: q.y * 1000, z: q.z * 1000 }))   // metr -> mm
+              : lm.map(q => ({ x: q.x * vw, y: q.y * vh, z: q.z * vw }))
+  }));
+  track(raw, nowMs / 1000);
+}
+
+function update(dt, now) {
+  const a = 1 - Math.exp(-dt * 16);
+  const lead = T.lead, second = T.second;
+  const ready = !!lead && T.count >= 0;
+  const tgt = { track: false, show: ready, shape: T.count, x: S.cx, y: S.cy, size: S.size };
+
+  if (lead) {
+    const p = lead.p;
+    const handSize = dist(p[0], p[9]);
+    const palm = {
+      x: (p[0].x + p[5].x + p[9].x + p[13].x + p[17].x) / 5,
+      y: (p[0].y + p[5].y + p[9].y + p[13].y + p[17].y) / 5
+    };
+
+    // Ikkinchi qo'l: bosh va ko'rsatkich barmoq uchlari orasidagi 3D masofa -> masshtab
+    let targetScale = 1;
+    if (second) {
+      const q = second.w;
+      const r = d3(q[4], q[8]) / Math.max(d3(q[0], q[9]), 1e-3);
+      targetScale = clamp(0.25 + (r - CFG.pinchMin) * CFG.pinchGain, 0.25, 2.5);
+    }
+    S.scale += (targetScale - S.scale) * a;
+
+    const size = clamp(handSize * CFG.sizeK * S.scale, 24, Math.min(W, H) * 0.85);
+    tgt.size = size;
+    tgt.x = clamp(palm.x, size * 0.6, W - size * 0.6);
+    tgt.y = Math.max(palm.y - H * CFG.hover, size * 0.8 + 12);
+    tgt.track = true;
+  } else {
+    S.scale += (1 - S.scale) * a;
+  }
+
+  animate(dt, now, tgt);
+
+  hint.style.opacity = lead ? 0 : 1;
+  const leadTxt = ready ? T.count : (lead ? "…" : "yo'q");
+  const secTxt = second ? `masshtab ×${S.scale.toFixed(2)}` : "yo'q";
+  statusEl.textContent = `asosiy qo'l: ${leadTxt} · ikkinchi qo'l: ${secTxt} · ${fps} fps`;
+}
+
+// ---------- Qo'l skeleti ----------
+function drawHand(h, color) {
+  const p = h.p;
+  ctx.save();
+  ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for (const [i, j] of CONN) { ctx.moveTo(p[i].x, p[i].y); ctx.lineTo(p[j].x, p[j].y); }
+  ctx.stroke();
+  for (let i = 0; i < p.length; i++) {
+    ctx.beginPath(); ctx.arc(p[i].x, p[i].y, (i === 4 || i === 8 || i === 12 || i === 16 || i === 20) ? 3.2 : 2, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function draw(now) {
+  ctx.clearRect(0, 0, W, H);
+  if (T.second) drawHand(T.second, "rgba(255,170,190,0.8)");
+  if (T.lead) drawHand(T.lead, "rgba(255,255,255,0.9)");
+  drawFigure(now);
+  drawParticles();
+}
+
+let last = performance.now();
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (modelReady) detect();
+  update(dt, now);
+  draw(now);
+}
+requestAnimationFrame(loop);
+
+// ---------- Ishga tushirish ----------
+async function createLandmarker(fileset, delegate) {
+  return HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: MODEL, delegate },
+    runningMode: "VIDEO",
+    numHands: 2,
+    minHandDetectionConfidence: 0.6,
+    minHandPresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+}
+
+async function init() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    hint.textContent = "Kamera uchun sahifa localhost yoki https orqali ochilishi kerak.";
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) {
+    hint.textContent = "Kameraga ruxsat berilmadi. Brauzer sozlamalarida kamerani yoqing.";
+    return;
+  }
+
+  hint.textContent = "Model yuklanmoqda…";
+  try {
+    const fileset = await FilesetResolver.forVisionTasks(WASM);
+    try { landmarker = await createLandmarker(fileset, "GPU"); }
+    catch (_) { landmarker = await createLandmarker(fileset, "CPU"); }
+    modelReady = true;
+    hint.textContent = "Qo'lingizni kadrga ko'rsating";
+  } catch (e) {
+    console.error(e);
+    hint.textContent = "Modelni yuklab bo'lmadi. Internetni tekshiring.";
+  }
+}
+init();
+</script>
+</body>
+</html>
